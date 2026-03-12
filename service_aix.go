@@ -1,5 +1,4 @@
 //go:build aix
-// +build aix
 
 // Copyright 2015 Daniel Theophanes.
 // Use of this source code is governed by a zlib-style
@@ -20,6 +19,11 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+)
+
+const (
+	SERVICE_NOT_RUNNING_STATUS   = "0513-004"
+	SERVICE_NOT_INSTALLED_STATUS = "0513-085"
 )
 
 const (
@@ -123,10 +127,17 @@ func (s *aixService) Install() error {
 	if err != nil {
 		return err
 	}
+
+	// Add the user to the configuration so that the service process is owned by the user when it is run.
+	serviceOwner := "0"
+	if s.Config.UserName != "" {
+		serviceOwner = s.Config.UserName
+	}
+
 	if len(s.Config.Arguments) > 0 {
-		err = run("mkssys", "-s", s.Name, "-p", path, "-a", strings.Join(s.Config.Arguments, " "), "-u", "0", "-R", "-Q", "-S", "-n", "15", "-f", "9", "-d", "-w", "30")
+		err = run("mkssys", "-s", s.Name, "-p", path, "-a", strings.Join(s.Config.Arguments, " "), "-u", serviceOwner, "-R", "-Q", "-S", "-n", "15", "-f", "9", "-d", "-w", "30")
 	} else {
-		err = run("mkssys", "-s", s.Name, "-p", path, "-u", "0", "-R", "-Q", "-S", "-n", "15", "-f", "9", "-d", "-w", "30")
+		err = run("mkssys", "-s", s.Name, "-p", path, "-u", serviceOwner, "-R", "-Q", "-S", "-n", "15", "-f", "9", "-d", "-w", "30")
 	}
 	if err != nil {
 		return err
@@ -198,23 +209,35 @@ func (s *aixService) Uninstall() error {
 
 func (s *aixService) Status() (Status, error) {
 	exitCode, out, err := runWithOutput("lssrc", "-s", s.Name)
-	if exitCode == 0 && err != nil {
-		if !strings.Contains(err.Error(), "failed with stderr") {
-			return StatusUnknown, err
-		}
+	if strings.Contains(out, SERVICE_NOT_INSTALLED_STATUS) {
+		return StatusUnknown, ErrNotInstalled
 	}
 
-	re := regexp.MustCompile(`\s+` + regexp.QuoteMeta(s.Name) + `\s+(\w+\s+)?(\d+\s+)?(\w+)`)
+	if err != nil {
+		if exitCode != 0 {
+			out := strings.TrimSpace(string(out))
+			return StatusUnknown, fmt.Errorf("command exited %d, output: %s", exitCode, out)
+		}
+		return StatusUnknown, fmt.Errorf("command exited, output: %s", out)
+	}
+
+	// The regex parses the 'lssrc' output line for the specific service.
+	// It matches: ^[whitespace][service_name][whitespace][optional_group][whitespace][optional_pid][whitespace][status]
+	// - matches[0]: full line
+	// - matches[1]: optional Group column (e.g., "tcpip")
+	// - matches[2]: optional PID column (only present if service is active)
+	// - matches[3]: Status column (e.g., "active", "inoperative")
+	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(s.Name) + `\s+(\S+\s+)?(\d+\s+)?(\w+)`)
 	matches := re.FindStringSubmatch(out)
 	if len(matches) == 4 {
+		// matches[3] is the Status column
 		switch matches[3] {
 		case "inoperative":
 			return StatusStopped, nil
 		case "active":
 			return StatusRunning, nil
 		default:
-			fmt.Printf("Got unknown service status %s\n", matches[3])
-			return StatusUnknown, errors.New("unknown status")
+			return StatusUnknown, errors.New("unknown status: " + matches[3])
 		}
 	}
 
@@ -235,7 +258,11 @@ func (s *aixService) Start() error {
 }
 
 func (s *aixService) Stop() error {
-	return run("stopsrc", "-s", s.Name)
+	_, output, err := runWithOutput("stopsrc", "-s", s.Name)
+	if strings.Contains(output, SERVICE_NOT_RUNNING_STATUS) {
+		return nil
+	}
+	return err
 }
 
 func (s *aixService) Restart() error {
