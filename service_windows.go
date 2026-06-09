@@ -5,6 +5,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -438,6 +439,10 @@ func (ws *windowsService) Status() (Status, error) {
 	case svc.StopPending:
 		fallthrough
 	case svc.Stopped:
+		const errorServiceNeverStarted = 1077
+		if status.Win32ExitCode != 0 && status.Win32ExitCode != errorServiceNeverStarted {
+			return StatusUnknown, errors.New("service in failed state")
+		}
 		return StatusStopped, nil
 	default:
 		return StatusUnknown, fmt.Errorf("unknown status %v", status)
