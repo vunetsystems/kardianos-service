@@ -7,6 +7,7 @@ package service
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -195,9 +196,12 @@ func (s *solarisService) Status() (Status, error) {
 	matches := re.FindStringSubmatch(out)
 	if len(matches) == 2 {
 		status := string(matches[1])
-		if status == "online" {
+		switch status {
+		case "online":
 			return StatusRunning, nil
-		} else {
+		case "maintenance":
+			return StatusUnknown, errors.New("service in maintenance state")
+		default:
 			return StatusStopped, nil
 		}
 	}

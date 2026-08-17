@@ -232,7 +232,7 @@ func (s *aixService) Status() (Status, error) {
 	if len(matches) == 4 {
 		// matches[3] is the Status column
 		switch matches[3] {
-		case "inoperative":
+		case "inoperative", "stopping":
 			return StatusStopped, nil
 		case "active":
 			return StatusRunning, nil
