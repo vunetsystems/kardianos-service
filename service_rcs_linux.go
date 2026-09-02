@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"text/template"
 	"time"
 )
 
@@ -84,13 +85,13 @@ func (s *rcs) configPath() (cp string, err error) {
 	return
 }
 
-var rcsTemplate = mustParse(rcsScript)
+func (s *rcs) template() *template.Template {
+	customScript := s.Option.string(optionRCSScript, "")
 
-func (s *rcs) template() (*tmpl, error) {
-	if custom := s.Option.string(optionRCSScript, ""); custom != "" {
-		return parseTemplate(custom)
+	if customScript != "" {
+		return template.Must(template.New("").Funcs(tf).Parse(customScript))
 	}
-	return rcsTemplate, nil
+	return template.Must(template.New("").Funcs(tf).Parse(rcsScript))
 }
 
 func (s *rcs) Install() error {
@@ -114,26 +115,18 @@ func (s *rcs) Install() error {
 		return err
 	}
 
-	c := s.Config
-	data := map[string]any{
-		"Description":      c.Description,
-		"DisplayName":      c.DisplayName,
-		"Name":             c.Name,
-		"Path":             path,
-		"Arguments":        c.Arguments,
-		"WorkingDirectory": c.WorkingDirectory,
-		"LogDirectory":     s.Option.string(optionLogDirectory, defaultLogDirectory),
+	var to = &struct {
+		*Config
+		Path         string
+		LogDirectory string
+	}{
+		s.Config,
+		path,
+		s.Option.string(optionLogDirectory, defaultLogDirectory),
 	}
 
-	t, err := s.template()
+	err = s.template().Execute(f, to)
 	if err != nil {
-		return err
-	}
-	out, err := t.render(data, tfs)
-	if err != nil {
-		return err
-	}
-	if _, err = f.WriteString(out); err != nil {
 		return err
 	}
 
@@ -223,25 +216,25 @@ func (s *rcs) Restart() error {
 const rcsScript = `#!/bin/sh
 # For RedHat and cousins:
 # chkconfig: - 99 01
-# description: {{Description}}
-# processname: {{Path}}
+# description: {{.Description}}
+# processname: {{.Path}}
 
 ### BEGIN INIT INFO
-# Provides:          {{Path}}
+# Provides:          {{.Path}}
 # Required-Start:
 # Required-Stop:
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: {{DisplayName}}
-# Description:       {{Description}}
+# Short-Description: {{.DisplayName}}
+# Description:       {{.Description}}
 ### END INIT INFO
 
-cmd="{{Path}}{{range Arguments}} {{. | cmd}}{{end}}"
+cmd="{{.Path}}{{range .Arguments}} {{.|cmd}}{{end}}"
 
-name={{Name}}
+name={{.Name}}
 pid_file="/var/run/$name.pid"
-stdout_log="{{LogDirectory}}/$name.log"
-stderr_log="{{LogDirectory}}/$name.err"
+stdout_log="{{.LogDirectory}}/$name.log"
+stderr_log="{{.LogDirectory}}/$name.err"
 
 [ -e /etc/sysconfig/$name ] && . /etc/sysconfig/$name
 
@@ -259,7 +252,7 @@ case "$1" in
             echo "Already started"
         else
             echo "Starting $name"
-            {{if WorkingDirectory}}cd '{{WorkingDirectory}}'{{end}}
+            {{if .WorkingDirectory}}cd '{{.WorkingDirectory}}'{{end}}
             $cmd >> "$stdout_log" 2>> "$stderr_log" &
             echo $! > "$pid_file"
             if ! is_running; then

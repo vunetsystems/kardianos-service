@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"regexp"
 	"syscall"
+	"text/template"
 	"time"
 )
 
@@ -54,13 +55,13 @@ func (s *openrc) Platform() string {
 	return s.platform
 }
 
-var openRCTemplate = mustParse(openRCScript)
+func (s *openrc) template() *template.Template {
+	customScript := s.Option.string(optionOpenRCScript, "")
 
-func (s *openrc) template() (*tmpl, error) {
-	if custom := s.Option.string(optionOpenRCScript, ""); custom != "" {
-		return parseTemplate(custom)
+	if customScript != "" {
+		return template.Must(template.New("").Funcs(tf).Parse(customScript))
 	}
-	return openRCTemplate, nil
+	return template.Must(template.New("").Funcs(tf).Parse(openRCScript))
 }
 
 func newOpenRCService(i Interface, platform string, c *Config) (Service, error) {
@@ -109,34 +110,18 @@ func (s *openrc) Install() error {
 		return err
 	}
 
-	c := s.Config
-
-	// depend() lists each dependency on its own tab-indented line; bake the
-	// tab in here so the template is a plain {{range}}.
-	deps := make([]string, len(c.Dependencies))
-	for i, d := range c.Dependencies {
-		deps[i] = "\t" + d
+	var to = &struct {
+		*Config
+		Path         string
+		LogDirectory string
+	}{
+		s.Config,
+		path,
+		s.Option.string(optionLogDirectory, defaultLogDirectory),
 	}
 
-	data := map[string]any{
-		"DisplayName":  c.DisplayName,
-		"Description":  c.Description,
-		"Path":         path,
-		"Arguments":    c.Arguments,
-		"Dependencies": deps,
-		"LogDirectory": s.Option.string(optionLogDirectory, defaultLogDirectory),
-		"EnvVars":      envVars(c.EnvVars, func(k, v string) string { return "export " + k + "=" + v }),
-	}
-
-	t, err := s.template()
+	err = s.template().Execute(f, to)
 	if err != nil {
-		return err
-	}
-	out, err := t.render(data, tfs)
-	if err != nil {
-		return err
-	}
-	if _, err = f.WriteString(out); err != nil {
 		return err
 	}
 	// run rc-update
@@ -236,16 +221,23 @@ func (s *openrc) run(action string, args ...string) error {
 
 const openRCScript = `#!/sbin/openrc-run
 supervisor=supervise-daemon
-name="{{DisplayName}}"
-description="{{Description}}"
-command={{Path | cmdEscape}}
-{{if Arguments}}command_args="{{range Arguments}}{{.}} {{end}}"
-{{end}}name=$(basename $(readlink -f $command))
-supervise_daemon_args="--stdout {{LogDirectory}}/${name}.log --stderr {{LogDirectory}}/${name}.err"
+name="{{.DisplayName}}"
+description="{{.Description}}"
+command={{.Path|cmdEscape}}
+{{- if .Arguments }}
+command_args="{{range .Arguments}}{{.}} {{end}}"
+{{- end }}
+name=$(basename $(readlink -f $command))
+supervise_daemon_args="--stdout {{.LogDirectory}}/${name}.log --stderr {{.LogDirectory}}/${name}.err"
 
-{{range EnvVars}}{{.}}
-{{end}}
-{{if Dependencies}}depend() {
-{{range Dependencies}}{{.}}
-{{end}}}
-{{end}}`
+{{range $k, $v := .EnvVars -}}
+export {{$k}}={{$v}}
+{{end -}}
+
+{{- if .Dependencies }}
+depend() {
+{{- range $i, $dep := .Dependencies}} 
+{{"\t"}}{{$dep}}{{end}}
+}
+{{- end}}
+`

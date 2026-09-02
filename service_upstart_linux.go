@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"text/template"
 )
 
 func isUpstart() bool {
@@ -114,13 +115,14 @@ func (s *upstart) getUpstartVersion() []int {
 	return parseVersion(matches[1])
 }
 
-var upstartTemplate = mustParse(upstartScript)
+func (s *upstart) template() *template.Template {
+	customScript := s.Option.string(optionUpstartScript, "")
 
-func (s *upstart) template() (*tmpl, error) {
-	if custom := s.Option.string(optionUpstartScript, ""); custom != "" {
-		return parseTemplate(custom)
+	if customScript != "" {
+		return template.Must(template.New("").Funcs(tf).Parse(customScript))
+	} else {
+		return template.Must(template.New("").Funcs(tf).Parse(upstartScript))
 	}
-	return upstartTemplate, nil
 }
 
 func (s *upstart) Install() error {
@@ -144,53 +146,23 @@ func (s *upstart) Install() error {
 		return err
 	}
 
-	c := s.Config
-
-	// Compound conditions the engine cannot express (and/not on UserName +
-	// HasSetUIDStanza) are collapsed here into ready-made strings.
-	setUID := ""
-	sudoPrefix := ""
-	if c.UserName != "" {
-		if s.hasSetUIDStanza() {
-			setUID = "setuid " + c.UserName
-		} else {
-			sudoPrefix = "sudo -E -u " + c.UserName + " "
-		}
-	}
-	killStanza := ""
-	if s.hasKillStanza() {
-		killStanza = "yes"
-	}
-	logOutput := ""
-	if s.Option.bool(optionLogOutput, optionLogOutputDefault) {
-		logOutput = "yes"
+	var to = &struct {
+		*Config
+		Path            string
+		HasKillStanza   bool
+		HasSetUIDStanza bool
+		LogOutput       bool
+		LogDirectory    string
+	}{
+		s.Config,
+		path,
+		s.hasKillStanza(),
+		s.hasSetUIDStanza(),
+		s.Option.bool(optionLogOutput, optionLogOutputDefault),
+		s.Option.string(optionLogDirectory, defaultLogDirectory),
 	}
 
-	data := map[string]any{
-		"Description":      c.Description,
-		"DisplayName":      c.DisplayName,
-		"Name":             c.Name,
-		"Path":             path,
-		"Arguments":        c.Arguments,
-		"ChRoot":           c.ChRoot,
-		"WorkingDirectory": c.WorkingDirectory,
-		"LogDirectory":     s.Option.string(optionLogDirectory, defaultLogDirectory),
-		"KillStanza":       killStanza,
-		"LogOutput":        logOutput,
-		"SetUID":           setUID,
-		"SudoPrefix":       sudoPrefix,
-	}
-
-	t, err := s.template()
-	if err != nil {
-		return err
-	}
-	out, err := t.render(data, tfs)
-	if err != nil {
-		return err
-	}
-	_, err = f.WriteString(out)
-	return err
+	return s.template().Execute(f, to)
 }
 
 func (s *upstart) Uninstall() error {
@@ -259,17 +231,17 @@ func (s *upstart) Restart() error {
 
 // The upstart script should stop with an INT or the Go runtime will terminate
 // the program before the Stop handler can run.
-const upstartScript = `# {{Description}}
+const upstartScript = `# {{.Description}}
 
-{{if DisplayName}}description    "{{DisplayName}}"{{end}}
+{{if .DisplayName}}description    "{{.DisplayName}}"{{end}}
 
-{{if KillStanza}}kill signal INT{{end}}
-{{if ChRoot}}chroot {{ChRoot}}{{end}}
-{{if WorkingDirectory}}chdir {{WorkingDirectory}}{{end}}
+{{if .HasKillStanza}}kill signal INT{{end}}
+{{if .ChRoot}}chroot {{.ChRoot}}{{end}}
+{{if .WorkingDirectory}}chdir {{.WorkingDirectory}}{{end}}
 start on filesystem or runlevel [2345]
 stop on runlevel [!2345]
 
-{{SetUID}}
+{{if and .UserName .HasSetUIDStanza}}setuid {{.UserName}}{{end}}
 
 respawn
 respawn limit 10 5
@@ -278,22 +250,22 @@ umask 022
 console none
 
 pre-start script
-    test -x {{Path}} || { stop; exit 0; }
+    test -x {{.Path}} || { stop; exit 0; }
 end script
 
 # Start
 script
-	{{if LogOutput}}
-	stdout_log="{{LogDirectory}}/{{Name}}.out"
-	stderr_log="{{LogDirectory}}/{{Name}}.err"
+	{{if .LogOutput}}
+	stdout_log="{{.LogDirectory}}/{{.Name}}.out"
+	stderr_log="{{.LogDirectory}}/{{.Name}}.err"
 	{{end}}
-
-	if [ -f "/etc/sysconfig/{{Name}}" ]; then
+	
+	if [ -f "/etc/sysconfig/{{.Name}}" ]; then
 		set -a
-		source /etc/sysconfig/{{Name}}
+		source /etc/sysconfig/{{.Name}}
 		set +a
 	fi
 
-	exec {{SudoPrefix}}{{Path}}{{range Arguments}} {{. | cmd}}{{end}}{{if LogOutput}} >> $stdout_log 2>> $stderr_log{{end}}
+	exec {{if and .UserName (not .HasSetUIDStanza)}}sudo -E -u {{.UserName}} {{end}}{{.Path}}{{range .Arguments}} {{.|cmd}}{{end}}{{if .LogOutput}} >> $stdout_log 2>> $stderr_log{{end}}
 end script
 `
