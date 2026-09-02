@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"regexp"
 	"syscall"
-	"text/template"
 	"time"
 )
 
@@ -80,23 +79,13 @@ func (s *solarisService) Platform() string {
 	return version
 }
 
-func (s *solarisService) template() *template.Template {
-	functions := template.FuncMap{
-		"bool": func(v bool) string {
-			if v {
-				return "true"
-			}
-			return "false"
-		},
-	}
+var manifestTemplate = mustParse(manifest)
 
-	customConfig := s.Option.string(optionSysvScript, "")
-
-	if customConfig != "" {
-		return template.Must(template.New("").Funcs(functions).Parse(customConfig))
-	} else {
-		return template.Must(template.New("").Funcs(functions).Parse(manifest))
+func (s *solarisService) template() (*tmpl, error) {
+	if custom := s.Option.string(optionSysvScript, ""); custom != "" {
+		return parseTemplate(custom)
 	}
+	return manifestTemplate, nil
 }
 
 func (s *solarisService) configPath() (string, error) {
@@ -133,19 +122,22 @@ func (s *solarisService) Install() error {
 	if err := xml.EscapeText(escaped, []byte(s.DisplayName)); err == nil {
 		Display = escaped.String()
 	}
-	var to = &struct {
-		*Config
-		Prefix  string
-		Display string
-		Path    string
-	}{
-		s.Config,
-		s.Prefix,
-		Display,
-		path,
+	data := map[string]any{
+		"Name":    s.Config.Name,
+		"Prefix":  s.Prefix,
+		"Display": Display,
+		"Path":    path,
 	}
 
-	err = s.template().Execute(f, to)
+	t, err := s.template()
+	if err != nil {
+		return err
+	}
+	out, err := t.render(data, nil)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString(out)
 	if err != nil {
 		return err
 	}
@@ -250,12 +242,12 @@ func (s *solarisService) SystemLogger(errs chan<- error) (Logger, error) {
 	return newSysLogger(s.Name, errs)
 }
 
-var manifest = `<?xml version="1.0"?>
+const manifest = `<?xml version="1.0"?>
 <!DOCTYPE service_bundle SYSTEM "/usr/share/lib/xml/dtd/service_bundle.dtd.1">
 
-<service_bundle type='manifest' name='golang-{{.Name}}'>
+<service_bundle type='manifest' name='golang-{{Name}}'>
 <service
-	name='{{.Prefix}}/{{.Name}}'
+	name='{{Prefix}}/{{Name}}'
 	type='service'
 	version='1'>
 
@@ -287,13 +279,13 @@ var manifest = `<?xml version="1.0"?>
 	<exec_method
 		type='method'
 		name='start'
-		exec='bash -c {{.Path}} &amp;'
+		exec='bash -c {{Path}} &amp;'
 		timeout_seconds='10' />
 
 	<exec_method
 		type='method'
 		name='stop'
-		exec='pkill -TERM -f {{.Path}}'
+		exec='pkill -TERM -f {{Path}}'
 		timeout_seconds='60' />
 
 	<!--
@@ -307,7 +299,7 @@ var manifest = `<?xml version="1.0"?>
 	<template>
                 <common_name>
                         <loctext xml:lang='C'>
-                                {{.Display}}
+                                {{Display}}
                         </loctext>
                 </common_name>
         </template>
