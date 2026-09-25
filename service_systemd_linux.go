@@ -264,10 +264,14 @@ func (s *systemd) Status() (Status, error) {
 		return StatusUnknown, ErrNotInstalled
 	case strings.HasPrefix(out, "activating"):
 		return StatusRunning, nil
+	case strings.HasPrefix(out, "deactivating"):
+		return StatusStopped, nil
+	case strings.HasPrefix(out, "reloading"):
+		return StatusRunning, nil
 	case strings.HasPrefix(out, "failed"):
 		return StatusUnknown, errors.New("service in failed state")
 	default:
-		return StatusUnknown, ErrNotInstalled
+		return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", strings.TrimSpace(out))
 	}
 }
 
