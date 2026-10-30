@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"regexp"
+	"strings"
 	"syscall"
 	"text/template"
 	"time"
@@ -182,30 +182,61 @@ func (s *solarisService) Uninstall() error {
 
 func (s *solarisService) Status() (Status, error) {
 	fmri := s.getFMRI()
-	exitCode, out, err := runWithOutput("svcs", fmri)
+	exitCode, out, err := runWithOutput("svcs", "-H", "-o", "state,nstate", fmri)
 	if exitCode != 0 {
-		return StatusUnknown, ErrNotInstalled
+		return StatusUnknown, smfQueryError(err, func() error {
+			return run("svcs", "-H", "-o", "state", smfRestarterFMRI)
+		})
+	}
+	if err != nil {
+		return StatusUnknown, err
+	}
+	return parseSMFState(out)
+}
+
+// parseSMFState maps the output of 'svcs -H -o state,nstate <fmri>' to a Status.
+//
+// While SMF is moving a service between states, svcs prints the current state with
+// a trailing '*' and nstate holds the state it is moving to; otherwise nstate is
+// '-'. A transition is reported by its destination, the way systemd's activating
+// and deactivating are, so a service being disabled reads as stopped rather than
+// as an unrecognized state.
+func parseSMFState(out string) (Status, error) {
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return StatusUnknown, fmt.Errorf("unexpected svcs output: %q", strings.TrimSpace(out))
 	}
 
-	// The regex extracts the service state from 'svcs' output.
-	// It expects the format: [STATE] [STIME/TIME] [FMRI]
-	// - matches[1]: The state (e.g., online, offline, maintenance)
-	// - \s+\S+\s+: Matches the STIME column (whitespace, non-whitespace chars, whitespace)
-	// - fmri: Matches the specific service identifier at the end of the line
-	re := regexp.MustCompile(`(degraded|disabled|legacy_run|maintenance|offline|online)\s+\S+\s+` + fmri)
-	matches := re.FindStringSubmatch(out)
-	if len(matches) == 2 {
-		status := string(matches[1])
-		switch status {
-		case "online":
-			return StatusRunning, nil
-		case "maintenance":
-			return StatusUnknown, errors.New("service in maintenance state")
-		default:
-			return StatusStopped, nil
-		}
+	state := strings.TrimSuffix(fields[0], "*")
+	if nstate := fields[1]; nstate != "-" {
+		state = nstate
 	}
-	return StatusUnknown, err
+
+	switch state {
+	case "online", "degraded":
+		return StatusRunning, nil
+	case "offline", "disabled", "uninitialized", "legacy_run":
+		return StatusStopped, nil
+	case "maintenance":
+		return StatusUnknown, errors.New("service in maintenance state")
+	default:
+		return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", state)
+	}
+}
+
+// smfRestarterFMRI is the master restarter, svc.startd. It exists whenever SMF is
+// running, so a query for it fails only when SMF itself cannot answer.
+const smfRestarterFMRI = "svc:/system/svc/restarter:default"
+
+// smfQueryError decides what a failed svcs query for the service's FMRI means. svcs
+// exits non-zero both when the FMRI does not exist and when it cannot reach the SMF
+// repository at all, and only the first means the service is not installed. probe
+// queries an instance that always exists to tell the two apart.
+func smfQueryError(queryErr error, probe func() error) error {
+	if probeErr := probe(); probeErr != nil {
+		return fmt.Errorf("svcs failed and SMF is not answering queries: %v", queryErr)
+	}
+	return ErrNotInstalled
 }
 
 func (s *solarisService) Start() error {
