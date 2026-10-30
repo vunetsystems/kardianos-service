@@ -156,7 +156,28 @@ func (s *solarisService) Install() error {
 		return err
 	}
 
-	return nil
+	return waitForImport(s.getFMRI(), smfImportTimeout)
+}
+
+// smfImportTimeout bounds how long Install waits for manifest-import to pick up the
+// new manifest.
+const smfImportTimeout = 30 * time.Second
+
+// waitForImport waits until SMF knows fmri. svcadm restart only requests the restart,
+// so manifest-import imports the manifest after Install's svcadm call returns, and a
+// Status call in between would read the service as not installed.
+func waitForImport(fmri string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		err := run("svcs", "-H", "-o", "state", fmri)
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("manifest-import did not import %s within %v: %w", fmri, timeout, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func (s *solarisService) Uninstall() error {
