@@ -270,7 +270,8 @@ func (s *solarisService) Status() (Status, error) {
 func parseSMFState(out string) (Status, error) {
 	fields := strings.Fields(out)
 	if len(fields) != 2 {
-		return StatusUnknown, fmt.Errorf("unexpected svcs output: %q", strings.TrimSpace(out))
+		// svcs found the service, so it is installed; only its state is unreadable.
+		return StatusUnknown, fmt.Errorf("service in unrecognized state: svcs printed %q", strings.TrimSpace(out))
 	}
 
 	state := strings.TrimSuffix(fields[0], "*")
