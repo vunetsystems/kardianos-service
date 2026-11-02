@@ -150,31 +150,70 @@ func (s *solarisService) Install() error {
 		return err
 	}
 
+	// manifest-import imports only manifests whose hash differs from the one it
+	// recorded for that path, and a record can outlive its service: an install that
+	// overlapped an uninstall's import run left the hash recorded with no service, and
+	// no later import picked the manifest up. Install refuses an existing manifest, so
+	// any record for this path is stale. Dropping it makes the import below load the
+	// manifest whatever came before. delhash fails when there is no record, the usual
+	// case, so its error is ignored; a real failure surfaces as the wait timing out.
+	run("svccfg", "delhash", "-d", confPath)
+
 	// import service
 	err = run("svcadm", "restart", "manifest-import")
 	if err != nil {
+		os.Remove(confPath)
 		return err
 	}
 
-	return waitForImport(s.getFMRI(), smfImportTimeout)
+	if err = waitForSMF(s.getFMRI(), true, smfImportTimeout); err != nil {
+		// Remove the manifest so that a retry is not refused as already installed.
+		os.Remove(confPath)
+		return err
+	}
+	return nil
 }
 
-// smfImportTimeout bounds how long Install waits for manifest-import to pick up the
-// new manifest.
+// smfImportTimeout bounds how long Install and Uninstall wait for manifest-import to
+// apply their change.
 const smfImportTimeout = 30 * time.Second
 
-// waitForImport waits until SMF knows fmri. svcadm restart only requests the restart,
-// so manifest-import imports the manifest after Install's svcadm call returns, and a
-// Status call in between would read the service as not installed.
-func waitForImport(fmri string, timeout time.Duration) error {
+// waitForSMF waits until SMF knows fmri when present is true, or no longer knows it
+// when present is false. svcadm restart only requests the restart, and svccfg import
+// of a manifest in a standard location does the same, so manifest-import imports or
+// deletes the service after Install's or Uninstall's call returns. Without the wait,
+// a Status call in between reads the old state, and an Install right after an
+// Uninstall overlaps the import run that is still deleting the service.
+func waitForSMF(fmri string, present bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for (run("svcs", "-H", "-o", "state", fmri) == nil) != present {
+		if time.Now().After(deadline) {
+			if present {
+				return fmt.Errorf("manifest-import did not import %s within %v", fmri, timeout)
+			}
+			return fmt.Errorf("manifest-import did not delete %s within %v", fmri, timeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil
+}
+
+// smfManifestImportFMRI is the service that imports manifests from the standard
+// locations into the SMF repository.
+const smfManifestImportFMRI = "svc:/system/manifest-import:default"
+
+// waitForManifestImport waits until manifest-import is online with no state change
+// pending, which is when its current run, and any restart requested during it, has
+// finished.
+func waitForManifestImport(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		err := run("svcs", "-H", "-o", "state", fmri)
-		if err == nil {
+		_, out, err := runWithOutput("svcs", "-H", "-o", "state,nstate", smfManifestImportFMRI)
+		if err == nil && strings.Join(strings.Fields(out), " ") == "online -" {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("manifest-import did not import %s within %v: %w", fmri, timeout, err)
+			return fmt.Errorf("manifest-import did not finish within %v: svcs reported %q", timeout, strings.TrimSpace(out))
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -198,7 +237,13 @@ func (s *solarisService) Uninstall() error {
 		return err
 	}
 
-	return nil
+	if err = waitForSMF(s.getFMRI(), false, smfImportTimeout); err != nil {
+		return err
+	}
+	// manifest-import deletes the service partway through its run, so wait for the
+	// run itself to finish too. An Install that starts while the run is still going
+	// can have its new manifest recorded as imported without the service.
+	return waitForManifestImport(smfImportTimeout)
 }
 
 func (s *solarisService) Status() (Status, error) {
