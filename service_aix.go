@@ -236,7 +236,7 @@ func (s *aixService) Status() (Status, error) {
 		case "active":
 			return StatusRunning, nil
 		default:
-			return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", matches[3])
+			return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, matches[3])
 		}
 	}
 

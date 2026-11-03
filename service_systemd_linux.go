@@ -246,6 +246,12 @@ func (s *systemd) Status() (Status, error) {
 	if exitCode == 0 && err != nil {
 		return StatusUnknown, err
 	}
+	// is-active prints a state even when it exits non-zero, as it does for every
+	// state but active. Nothing on stdout means systemctl failed before it could
+	// report one, typically because it could not reach systemd.
+	if exitCode != 0 && strings.TrimSpace(out) == "" {
+		return StatusUnknown, fmt.Errorf("systemctl is-active %s failed: %w", s.unitName(), err)
+	}
 
 	switch {
 	case strings.HasPrefix(out, "active"):
@@ -273,7 +279,7 @@ func (s *systemd) Status() (Status, error) {
 	case strings.HasPrefix(out, "failed"):
 		return StatusUnknown, errors.New("service in failed state")
 	default:
-		return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", strings.TrimSpace(out))
+		return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, strings.TrimSpace(out))
 	}
 }
 

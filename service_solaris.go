@@ -271,7 +271,7 @@ func parseSMFState(out string) (Status, error) {
 	fields := strings.Fields(out)
 	if len(fields) != 2 {
 		// svcs found the service, so it is installed; only its state is unreadable.
-		return StatusUnknown, fmt.Errorf("service in unrecognized state: svcs printed %q", strings.TrimSpace(out))
+		return StatusUnknown, fmt.Errorf("%w: svcs printed %q", ErrUnrecognizedState, strings.TrimSpace(out))
 	}
 
 	state := strings.TrimSuffix(fields[0], "*")
@@ -287,7 +287,7 @@ func parseSMFState(out string) (Status, error) {
 	case "maintenance":
 		return StatusUnknown, errors.New("service in maintenance state")
 	default:
-		return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", state)
+		return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, state)
 	}
 }
 
