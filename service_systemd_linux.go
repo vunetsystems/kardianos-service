@@ -250,8 +250,10 @@ func (s *systemd) Status() (Status, error) {
 	switch {
 	case strings.HasPrefix(out, "active"):
 		return StatusRunning, nil
-	case strings.HasPrefix(out, "inactive"):
-		// inactive can also mean its not installed, check unit files
+	case strings.HasPrefix(out, "inactive"), strings.HasPrefix(out, "unknown"):
+		// inactive can also mean its not installed, check unit files. Older systemd,
+		// such as 219 on CentOS/RHEL 7, prints unknown for a unit that does not exist
+		// where later versions print inactive.
 		exitCode, out, err := s.runWithOutput("systemctl", "list-unit-files", "-t", "service", s.unitName())
 		if exitCode == 0 && err != nil {
 			return StatusUnknown, err
