@@ -8,7 +8,6 @@ package service
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -237,7 +236,7 @@ func (s *aixService) Status() (Status, error) {
 		case "active":
 			return StatusRunning, nil
 		default:
-			return StatusUnknown, errors.New("unknown status: " + matches[3])
+			return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, matches[3])
 		}
 	}
 

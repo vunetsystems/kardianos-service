@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"regexp"
+	"strings"
 	"syscall"
 	"text/template"
 	"time"
@@ -150,13 +150,73 @@ func (s *solarisService) Install() error {
 		return err
 	}
 
+	// manifest-import imports only manifests whose hash differs from the one it
+	// recorded for that path, and a record can outlive its service: an install that
+	// overlapped an uninstall's import run left the hash recorded with no service, and
+	// no later import picked the manifest up. Install refuses an existing manifest, so
+	// any record for this path is stale. Dropping it makes the import below load the
+	// manifest whatever came before. delhash fails when there is no record, the usual
+	// case, so its error is ignored; a real failure surfaces as the wait timing out.
+	run("svccfg", "delhash", "-d", confPath)
+
 	// import service
 	err = run("svcadm", "restart", "manifest-import")
 	if err != nil {
+		os.Remove(confPath)
 		return err
 	}
 
+	if err = waitForSMF(s.getFMRI(), true, smfImportTimeout); err != nil {
+		// Remove the manifest so that a retry is not refused as already installed.
+		os.Remove(confPath)
+		return err
+	}
 	return nil
+}
+
+// smfImportTimeout bounds how long Install and Uninstall wait for manifest-import to
+// apply their change.
+const smfImportTimeout = 30 * time.Second
+
+// waitForSMF waits until SMF knows fmri when present is true, or no longer knows it
+// when present is false. svcadm restart only requests the restart, and svccfg import
+// of a manifest in a standard location does the same, so manifest-import imports or
+// deletes the service after Install's or Uninstall's call returns. Without the wait,
+// a Status call in between reads the old state, and an Install right after an
+// Uninstall overlaps the import run that is still deleting the service.
+func waitForSMF(fmri string, present bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for (run("svcs", "-H", "-o", "state", fmri) == nil) != present {
+		if time.Now().After(deadline) {
+			if present {
+				return fmt.Errorf("manifest-import did not import %s within %v", fmri, timeout)
+			}
+			return fmt.Errorf("manifest-import did not delete %s within %v", fmri, timeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil
+}
+
+// smfManifestImportFMRI is the service that imports manifests from the standard
+// locations into the SMF repository.
+const smfManifestImportFMRI = "svc:/system/manifest-import:default"
+
+// waitForManifestImport waits until manifest-import is online with no state change
+// pending, which is when its current run, and any restart requested during it, has
+// finished.
+func waitForManifestImport(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		_, out, err := runWithOutput("svcs", "-H", "-o", "state,nstate", smfManifestImportFMRI)
+		if err == nil && strings.Join(strings.Fields(out), " ") == "online -" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("manifest-import did not finish within %v: svcs reported %q", timeout, strings.TrimSpace(out))
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func (s *solarisService) Uninstall() error {
@@ -177,35 +237,73 @@ func (s *solarisService) Uninstall() error {
 		return err
 	}
 
-	return nil
+	if err = waitForSMF(s.getFMRI(), false, smfImportTimeout); err != nil {
+		return err
+	}
+	// manifest-import deletes the service partway through its run, so wait for the
+	// run itself to finish too. An Install that starts while the run is still going
+	// can have its new manifest recorded as imported without the service.
+	return waitForManifestImport(smfImportTimeout)
 }
 
 func (s *solarisService) Status() (Status, error) {
 	fmri := s.getFMRI()
-	exitCode, out, err := runWithOutput("svcs", fmri)
+	exitCode, out, err := runWithOutput("svcs", "-H", "-o", "state,nstate", fmri)
 	if exitCode != 0 {
-		return StatusUnknown, ErrNotInstalled
+		return StatusUnknown, smfQueryError(err, func() error {
+			return run("svcs", "-H", "-o", "state", smfRestarterFMRI)
+		})
+	}
+	if err != nil {
+		return StatusUnknown, err
+	}
+	return parseSMFState(out)
+}
+
+// parseSMFState maps the output of 'svcs -H -o state,nstate <fmri>' to a Status.
+//
+// While SMF is moving a service between states, svcs prints the current state with
+// a trailing '*' and nstate holds the state it is moving to; otherwise nstate is
+// '-'. A transition is reported by its destination, the way systemd's activating
+// and deactivating are, so a service being disabled reads as stopped rather than
+// as an unrecognized state.
+func parseSMFState(out string) (Status, error) {
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		// svcs found the service, so it is installed; only its state is unreadable.
+		return StatusUnknown, fmt.Errorf("%w: svcs printed %q", ErrUnrecognizedState, strings.TrimSpace(out))
 	}
 
-	// The regex extracts the service state from 'svcs' output.
-	// It expects the format: [STATE] [STIME/TIME] [FMRI]
-	// - matches[1]: The state (e.g., online, offline, maintenance)
-	// - \s+\S+\s+: Matches the STIME column (whitespace, non-whitespace chars, whitespace)
-	// - fmri: Matches the specific service identifier at the end of the line
-	re := regexp.MustCompile(`(degraded|disabled|legacy_run|maintenance|offline|online)\s+\S+\s+` + fmri)
-	matches := re.FindStringSubmatch(out)
-	if len(matches) == 2 {
-		status := string(matches[1])
-		switch status {
-		case "online":
-			return StatusRunning, nil
-		case "maintenance":
-			return StatusUnknown, errors.New("service in maintenance state")
-		default:
-			return StatusStopped, nil
-		}
+	state := strings.TrimSuffix(fields[0], "*")
+	if nstate := fields[1]; nstate != "-" {
+		state = nstate
 	}
-	return StatusUnknown, err
+
+	switch state {
+	case "online", "degraded":
+		return StatusRunning, nil
+	case "offline", "disabled", "uninitialized", "legacy_run":
+		return StatusStopped, nil
+	case "maintenance":
+		return StatusUnknown, errors.New("service in maintenance state")
+	default:
+		return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, state)
+	}
+}
+
+// smfRestarterFMRI is the master restarter, svc.startd. It exists whenever SMF is
+// running, so a query for it fails only when SMF itself cannot answer.
+const smfRestarterFMRI = "svc:/system/svc/restarter:default"
+
+// smfQueryError decides what a failed svcs query for the service's FMRI means. svcs
+// exits non-zero both when the FMRI does not exist and when it cannot reach the SMF
+// repository at all, and only the first means the service is not installed. probe
+// queries an instance that always exists to tell the two apart.
+func smfQueryError(queryErr error, probe func() error) error {
+	if probeErr := probe(); probeErr != nil {
+		return fmt.Errorf("svcs failed and SMF is not answering queries: %v", queryErr)
+	}
+	return ErrNotInstalled
 }
 
 func (s *solarisService) Start() error {

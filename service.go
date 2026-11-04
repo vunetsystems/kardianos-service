@@ -153,6 +153,10 @@ var (
 	ErrNoServiceSystemDetected = errors.New("No service system detected.")
 	// ErrNotInstalled is returned when the service is not installed.
 	ErrNotInstalled = errors.New("the service is not installed")
+	// ErrUnrecognizedState is returned, wrapped with the state, when the service
+	// manager reports a state for the service that Status does not map. The manager
+	// found the service, so it is installed; only its state is unknown.
+	ErrUnrecognizedState = errors.New("service in unrecognized state")
 )
 
 // New creates a new service based on a service interface and configuration.

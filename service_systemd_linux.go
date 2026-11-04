@@ -246,12 +246,20 @@ func (s *systemd) Status() (Status, error) {
 	if exitCode == 0 && err != nil {
 		return StatusUnknown, err
 	}
+	// is-active prints a state even when it exits non-zero, as it does for every
+	// state but active. Nothing on stdout means systemctl failed before it could
+	// report one, typically because it could not reach systemd.
+	if exitCode != 0 && strings.TrimSpace(out) == "" {
+		return StatusUnknown, fmt.Errorf("systemctl is-active %s failed: %w", s.unitName(), err)
+	}
 
 	switch {
 	case strings.HasPrefix(out, "active"):
 		return StatusRunning, nil
-	case strings.HasPrefix(out, "inactive"):
-		// inactive can also mean its not installed, check unit files
+	case strings.HasPrefix(out, "inactive"), strings.HasPrefix(out, "unknown"):
+		// inactive can also mean its not installed, check unit files. Older systemd,
+		// such as 219 on CentOS/RHEL 7, prints unknown for a unit that does not exist
+		// where later versions print inactive.
 		exitCode, out, err := s.runWithOutput("systemctl", "list-unit-files", "-t", "service", s.unitName())
 		if exitCode == 0 && err != nil {
 			return StatusUnknown, err
@@ -271,7 +279,7 @@ func (s *systemd) Status() (Status, error) {
 	case strings.HasPrefix(out, "failed"):
 		return StatusUnknown, errors.New("service in failed state")
 	default:
-		return StatusUnknown, fmt.Errorf("service in unrecognized state: %s", strings.TrimSpace(out))
+		return StatusUnknown, fmt.Errorf("%w: %s", ErrUnrecognizedState, strings.TrimSpace(out))
 	}
 }
 
