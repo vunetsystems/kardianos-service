@@ -171,12 +171,18 @@ func (s *solarisService) Install() error {
 		os.Remove(confPath)
 		return err
 	}
-	return nil
+	// manifest-import makes the service visible partway through its run, so wait
+	// for the run itself to finish too. Returning earlier lets a following
+	// Uninstall remove the manifest and restart manifest-import while this run is
+	// still going; the restarted run then finds nothing to clean up and leaves the
+	// service registered with no manifest behind it. The service is imported by
+	// now, so on a timeout the manifest is kept rather than removed.
+	return waitForManifestImport(smfImportTimeout)
 }
 
-// smfImportTimeout bounds how long Install and Uninstall wait for manifest-import to
-// apply their change.
-const smfImportTimeout = 30 * time.Second
+// smfImportTimeout bounds how long Install and Uninstall each wait for manifest-import
+// to apply their change, and again for its run to finish.
+const smfImportTimeout = 90 * time.Second
 
 // waitForSMF waits until SMF knows fmri when present is true, or no longer knows it
 // when present is false. svcadm restart only requests the restart, and svccfg import
